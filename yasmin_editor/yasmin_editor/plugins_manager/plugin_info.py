@@ -81,3 +81,11 @@ class PluginInfo:
             root = tree.getroot()
             outcomes_str: str = root.attrib.get("outcomes", "")
             self.outcomes = outcomes_str.split() if outcomes_str else []
+            self.description = root.attrib.get("description", "")
+            self.outcome_descriptions = {}
+
+            for outcome_elem in root.findall("FinalOutcome"):
+                outcome_name = outcome_elem.attrib.get("name", "")
+                outcome_description = outcome_elem.attrib.get("description", "")
+                if outcome_name and outcome_description:
+                    self.outcome_descriptions[outcome_name] = outcome_description
