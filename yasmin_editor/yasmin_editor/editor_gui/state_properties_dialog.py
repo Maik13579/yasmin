@@ -32,7 +32,8 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
-    QWidget)
+    QWidget,
+)
 from yasmin_editor.plugins_manager.plugin_info import PluginInfo
 
 
