@@ -89,3 +89,37 @@ class PluginInfo:
                 outcome_description = outcome_elem.attrib.get("description", "")
                 if outcome_name and outcome_description:
                     self.outcome_descriptions[outcome_name] = outcome_description
+
+            for key_elem in root.findall("Key"):
+                key_name = key_elem.attrib.get("name", "")
+                if not key_name:
+                    continue
+
+                key_data = {
+                    "name": key_name,
+                    "description": key_elem.attrib.get("description", ""),
+                    "default_value_type": key_elem.attrib.get("default_type", "str"),
+                    "default_value": key_elem.attrib.get("default_value", ""),
+                    "has_default": "default_value" in key_elem.attrib,
+                }
+
+                key_type = key_elem.attrib.get("type", "IN")
+                if key_type in ("IN", "IN/OUT"):
+                    self.input_keys.append(dict(key_data))
+                if key_type in ("OUT", "IN/OUT"):
+                    self.output_keys.append(dict(key_data))
+
+            if not self.input_keys and not self.output_keys:
+                for default_elem in root.findall("Default"):
+                    key_name = default_elem.attrib.get("key", "")
+                    if not key_name:
+                        continue
+                    self.input_keys.append(
+                        {
+                            "name": key_name,
+                            "description": default_elem.attrib.get("description", ""),
+                            "default_value_type": default_elem.attrib.get("type", "str"),
+                            "default_value": default_elem.attrib.get("value", ""),
+                            "has_default": True,
+                        }
+                    )
