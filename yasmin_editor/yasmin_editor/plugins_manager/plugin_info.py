@@ -15,7 +15,7 @@
 
 import os
 import importlib
-from typing import List, Optional
+from typing import List, Optional, Dict
 from lxml import etree as ET
 from yasmin_pybind_bridge import CppStateFactory
 from ament_index_python import get_package_share_path
@@ -40,6 +40,7 @@ class PluginInfo:
         self.package_name: Optional[str] = package_name
         self.outcomes: List[str] = []
         self.description: str = ""
+        self.outcome_descriptions: Dict[str, str] = {}
         self.input_keys: List[dict] = []
         self.output_keys: List[dict] = []
 
@@ -50,6 +51,7 @@ class PluginInfo:
             self.outcomes = list(instance.get_outcomes())
             try:
                 self.description = instance.get_description()
+                self.outcome_descriptions = instance.get_outcome_descriptions()
                 self.input_keys = list(instance.get_input_keys())
                 self.output_keys = list(instance.get_output_keys())
             except Exception:
@@ -59,6 +61,7 @@ class PluginInfo:
             self.outcomes = list(instance.get_outcomes())
             try:
                 self.description = instance.get_description()
+                self.outcome_descriptions = instance.get_outcome_descriptions()
                 self.input_keys = list(instance.get_input_keys())
                 self.output_keys = list(instance.get_output_keys())
             except Exception:
