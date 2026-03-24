@@ -162,9 +162,7 @@ class StatePropertiesDialog(QDialog):
 
         self.remappings_table: QTableWidget = QTableWidget(0, 2)
         self.remappings_table.setHorizontalHeaderLabels(["Old Key", "New Key"])
-        self.remappings_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.Stretch
-        )
+        self.remappings_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.remappings_table.setMinimumHeight(80)
         self.remappings_table.setMaximumHeight(150)
         remappings_layout.addWidget(self.remappings_table)
@@ -260,7 +258,6 @@ class StatePropertiesDialog(QDialog):
                 sections.append("")
             sections.append("Outcomes:")
             sections.extend([f" - {outcome}" for outcome in outcomes])
-
 
         if input_keys:
             if sections:
