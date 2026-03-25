@@ -23,6 +23,7 @@ from yasmin_editor.plugins_manager.plugin_info import PluginInfo
 from yasmin_editor.plugins_manager.plugin_manager import PluginManager
 
 IGNORE_XML_FILES = {"package.xml", "plugins.xml"}
+INPUT_KEY_TYPES = {"IN", "IN/OUT"}
 
 
 def plugin_id(plugin) -> str:
@@ -128,7 +129,7 @@ def input_completer(prefix, parsed_args, **kwargs):
     if not selected_plugin_id:
         return []
 
-    plugin = find_plugin_fast(selected_plugin_id)
+    plugin = find_plugin(selected_plugin_id, include_xml=False)
     if plugin is None:
         return []
 
@@ -167,6 +168,78 @@ def is_state_machine_xml(path: Path) -> bool:
         return strip_namespace(root.tag) == "StateMachine"
     except (ET.ParseError, OSError, StopIteration):
         return False
+
+
+def _iter_root_children(root: ET.Element):
+    for child in root:
+        if strip_namespace(child.tag):
+            yield child
+
+
+def get_state_machine_input_keys(state_machine_file: str) -> list[dict[str, str]]:
+    try:
+        root = ET.parse(state_machine_file).getroot()
+    except (ET.ParseError, OSError):
+        return []
+
+    if strip_namespace(root.tag) != "StateMachine":
+        return []
+
+    keys: list[dict[str, str]] = []
+    for child in _iter_root_children(root):
+        if strip_namespace(child.tag) != "Key":
+            continue
+
+        key_type = (child.attrib.get("type") or "").strip().upper()
+        if key_type not in INPUT_KEY_TYPES:
+            continue
+
+        default_type = (child.attrib.get("default_type") or "").strip()
+        if not default_type:
+            continue
+
+        keys.append(
+            {
+                "name": child.attrib.get("name", ""),
+                "type": key_type,
+                "description": child.attrib.get("description", ""),
+                "default_type": default_type,
+                "default_value": child.attrib.get("default_value", ""),
+            }
+        )
+
+    return [key for key in keys if key.get("name", "")]
+
+
+def run_input_completer(prefix, parsed_args, **kwargs):
+    state_machine_file = getattr(parsed_args, "state_machine_file", None)
+    if not state_machine_file:
+        return []
+
+    input_keys = get_state_machine_input_keys(state_machine_file)
+    if not input_keys:
+        return []
+
+    already_used = set()
+    raw_inputs = getattr(parsed_args, "input", None) or []
+
+    for entry in raw_inputs:
+        if "=" not in entry:
+            continue
+        key, _ = entry.split("=", 1)
+        already_used.add(key.strip())
+
+    matches: list[str] = []
+    for key in input_keys:
+        name = key.get("name", "")
+        if not name or name in already_used:
+            continue
+
+        suggestion = f"{name}="
+        if suggestion.startswith(prefix):
+            matches.append(suggestion)
+
+    return matches
 
 
 def xml_file_completer(prefix, parsed_args, **kwargs):
