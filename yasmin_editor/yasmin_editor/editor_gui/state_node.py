@@ -93,7 +93,10 @@ class StateNode(QGraphicsEllipseItem):
             canvas = self.scene().views()[0]
             if hasattr(canvas, "editor_ref") and canvas.editor_ref:
                 self.setSelected(True)
-                canvas.editor_ref.edit_state()
+                if event.modifiers() & Qt.ControlModifier and self.plugin_info and self.plugin_info.plugin_type == "xml":
+                    canvas.editor_ref.enter_xml_preview(self)
+                else:
+                    canvas.editor_ref.edit_state()
                 event.accept()
                 return
         super().mouseDoubleClickEvent(event)
@@ -101,7 +104,7 @@ class StateNode(QGraphicsEllipseItem):
     def itemChange(self, change: QGraphicsItem.GraphicsItemChange, value: Any) -> Any:
         if change == QGraphicsItem.ItemPositionChange and isinstance(value, QPointF):
             if self.parent_container:
-                container_rect = self.parent_container.rect()
+                container_rect = self.parent_container.get_child_bounds_rect()
                 state_rect = self.boundingRect()
                 new_pos: QPointF = value
 

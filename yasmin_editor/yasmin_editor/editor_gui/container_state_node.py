@@ -16,7 +16,7 @@
 import math
 from typing import Dict, List, Optional, Union, Any, Set, TYPE_CHECKING
 from PyQt5.QtWidgets import QGraphicsItem, QGraphicsTextItem, QGraphicsRectItem
-from PyQt5.QtCore import Qt, QPointF
+from PyQt5.QtCore import Qt, QPointF, QRectF
 from PyQt5.QtGui import QPen, QBrush, QColor, QFont
 
 from yasmin_editor.editor_gui.connection_port import ConnectionPort
@@ -77,23 +77,17 @@ class ContainerStateNode(QGraphicsRectItem):
         self.min_width = 1000
         self.min_height = 800
         self.xml_file: Optional[str] = None
+        self.blackboard_key_metadata: Dict[str, Dict[str, str]] = {}
+        self._content_rect = QRectF(-500, -400, 1000, 800)
+        self._compact_rect = QRectF(-90, -45, 180, 90)
+        self._entered = False
 
         self.setPos(x, y)
         self.setFlag(QGraphicsItem.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
 
-        self.setBrush(
-            QBrush(
-                QColor(255, 220, 150, 180)
-                if is_concurrence
-                else QColor(173, 216, 230, 180)
-            )
-        )
-        self.setPen(QPen(QColor(255, 140, 0) if is_concurrence else QColor(0, 0, 180), 3))
-
         self.header = QGraphicsRectItem(self)
-        self.header.setRect(-500, -400, 1000, 50)
         self.header.setBrush(
             QBrush(QColor(255, 140, 0) if is_concurrence else QColor(0, 100, 200))
         )
@@ -101,28 +95,39 @@ class ContainerStateNode(QGraphicsRectItem):
 
         self.title = QGraphicsTextItem(self)
         self.title.setDefaultTextColor(Qt.white)
-        font = QFont()
-        font.setPointSize(12)
-        font.setBold(True)
-        self.title.setFont(font)
-        self.title.setPlainText(
-            f"{'CONCURRENCE' if is_concurrence else 'STATE MACHINE'}: {name}"
-        )
-        title_rect = self.title.boundingRect()
-        self.title.setPos(-title_rect.width() / 2, -385)
+        title_font = QFont()
+        title_font.setPointSize(12)
+        title_font.setBold(True)
+        self.title.setFont(title_font)
+
+        self.type_label = QGraphicsTextItem(self)
+        self.type_label.setDefaultTextColor(Qt.darkGray)
+        compact_font = QFont()
+        compact_font.setPointSize(8)
+        self.type_label.setFont(compact_font)
 
         if not is_concurrence:
             self.start_state_label = QGraphicsTextItem(self)
             self.start_state_label.setDefaultTextColor(QColor(0, 100, 0))
             self._set_label_font(self.start_state_label)
-            self.update_label()
         else:
             self.default_outcome_label = QGraphicsTextItem(self)
             self.default_outcome_label.setDefaultTextColor(QColor(139, 69, 19))
             self._set_label_font(self.default_outcome_label)
-            self.update_label()
 
         self.connection_port = ConnectionPort(self)
+        self.update_label()
+        self.apply_display_mode()
+
+    def get_child_bounds_rect(self) -> QRectF:
+        return QRectF(self._content_rect)
+
+    def is_entered(self) -> bool:
+        return self._entered
+
+    def set_entered(self, entered: bool) -> None:
+        self._entered = entered
+        self.apply_display_mode()
 
     def _set_label_font(self, label: QGraphicsTextItem) -> None:
         font = QFont()
@@ -136,8 +141,6 @@ class ContainerStateNode(QGraphicsRectItem):
                 f"Initial: {self.start_state}" if self.start_state else "Initial: (none)"
             )
             self.start_state_label.setPlainText(text)
-            rect = self.start_state_label.boundingRect()
-            self.start_state_label.setPos(-rect.width() / 2, -45)
         elif hasattr(self, "default_outcome_label"):
             text = (
                 f"Default: {self.default_outcome}"
@@ -145,26 +148,98 @@ class ContainerStateNode(QGraphicsRectItem):
                 else "Default: (none)"
             )
             self.default_outcome_label.setPlainText(text)
-            rect = self.default_outcome_label.boundingRect()
-            self.default_outcome_label.setPos(-rect.width() / 2, -45)
+        self.update_visual_elements()
+
+    def update_start_state_label(self) -> None:
+        self.update_label()
+
+    def update_default_outcome_label(self) -> None:
+        self.update_label()
+
+    def apply_display_mode(self) -> None:
+        if self.is_concurrence:
+            self.setRect(self._content_rect)
+            self.setBrush(QBrush(QColor(255, 220, 150, 180)))
+            self.setPen(QPen(QColor(255, 140, 0), 3))
+            self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+            self.setAcceptedMouseButtons(Qt.AllButtons)
+            self.header.show()
+            self.title.show()
+            self.type_label.hide()
+            self.title.setDefaultTextColor(Qt.white)
+            self.title.setPlainText(f"CONCURRENCE: {self.name}")
+            if hasattr(self, "start_state_label"):
+                self.start_state_label.hide()
+            if hasattr(self, "default_outcome_label"):
+                self.default_outcome_label.show()
+            self.connection_port.show()
+            self.update_visual_elements()
+            return
+
+        if self._entered:
+            self.setRect(self._content_rect)
+            self.setBrush(QBrush(Qt.NoBrush))
+            self.setPen(QPen(Qt.NoPen))
+            self.setFlag(QGraphicsItem.ItemIsSelectable, False)
+            self.setAcceptedMouseButtons(Qt.NoButton)
+            self.header.hide()
+            self.title.hide()
+            self.type_label.hide()
+            if hasattr(self, "start_state_label"):
+                self.start_state_label.hide()
+            if hasattr(self, "default_outcome_label"):
+                self.default_outcome_label.hide()
+            self.connection_port.hide()
+            return
+
+        self.setRect(self._compact_rect)
+        self.setBrush(QBrush(QColor(178, 151, 255, 180)))
+        self.setPen(QPen(QColor(98, 65, 195), 3))
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setAcceptedMouseButtons(Qt.AllButtons)
+        self.header.hide()
+        self.title.show()
+        self.type_label.show()
+        self.title.setDefaultTextColor(Qt.black)
+        self.title.setPlainText(self.name)
+        self.type_label.setPlainText("FSM")
+        if hasattr(self, "start_state_label"):
+            self.start_state_label.hide()
+        self.connection_port.show()
+        self.update_visual_elements()
 
     def update_visual_elements(self) -> None:
         rect = self.rect()
         self.header.setRect(rect.left(), rect.top(), rect.width(), 50)
+
         title_rect = self.title.boundingRect()
+        if self.is_concurrence:
+            title_y = rect.top() + 12
+        else:
+            title_y = rect.top() + 12
         self.title.setPos(
-            rect.left() + rect.width() / 2 - title_rect.width() / 2, rect.top() + 12
+            rect.left() + rect.width() / 2 - title_rect.width() / 2,
+            title_y,
         )
+
+        if self.type_label.isVisible():
+            type_rect = self.type_label.boundingRect()
+            self.type_label.setPos(
+                rect.left() + rect.width() / 2 - type_rect.width() / 2,
+                rect.top() + rect.height() - 24,
+            )
+
         for label in [
             getattr(self, "start_state_label", None),
             getattr(self, "default_outcome_label", None),
         ]:
-            if label:
+            if label and label.isVisible():
                 label_rect = label.boundingRect()
                 label.setPos(
                     rect.left() + rect.width() / 2 - label_rect.width() / 2,
                     rect.top() + 52,
                 )
+
         if hasattr(self, "connection_port"):
             self.connection_port.update_position_for_container()
 
@@ -198,35 +273,36 @@ class ContainerStateNode(QGraphicsRectItem):
         if not self.child_states:
             return
 
-        rect = self.rect()
-        CHILD_PADDING_X: int = 60
-        CHILD_PADDING_Y: int = 110
-        CHILD_SPACING_X: int = 700
-        CHILD_SPACING_Y: int = 650
-        CHILDREN_PER_COLUMN: int = 3
+        rect = self.get_child_bounds_rect()
+        child_padding_x = 60
+        child_padding_y = 110
+        child_spacing_x = 700
+        child_spacing_y = 650
+        children_per_column = 3
 
         sorted_children = sorted(self.child_states.items(), key=lambda x: x[0])
 
-        x_position: float = rect.left() + CHILD_PADDING_X
-        y_position: float = rect.top() + CHILD_PADDING_Y
-        column_index: int = 0
-        row_index: int = 0
+        x_position = rect.left() + child_padding_x
+        y_position = rect.top() + child_padding_y
+        row_index = 0
 
-        for name, child in sorted_children:
+        for _name, child in sorted_children:
+            if getattr(child, "_xml_position_loaded", False):
+                continue
             child.setPos(x_position, y_position)
             row_index += 1
 
-            if row_index >= CHILDREN_PER_COLUMN:
-                column_index += 1
+            if row_index >= children_per_column:
                 row_index = 0
-                x_position += CHILD_SPACING_X
-                y_position = rect.top() + CHILD_PADDING_Y
+                x_position += child_spacing_x
+                y_position = rect.top() + child_padding_y
             else:
-                if isinstance(child, ContainerStateNode):
-                    child_height: float = child.rect().height()
-                else:
-                    child_height = child.boundingRect().height()
-                y_position += max(child_height, 200) + CHILD_SPACING_Y
+                child_height = (
+                    child.rect().height()
+                    if isinstance(child, ContainerStateNode)
+                    else child.boundingRect().height()
+                )
+                y_position += max(child_height, 200) + child_spacing_y
 
     def add_final_outcome(self, outcome_node: "FinalOutcomeNode") -> None:
         """Add a final outcome to this container.
@@ -238,7 +314,6 @@ class ContainerStateNode(QGraphicsRectItem):
             self.final_outcomes[outcome_node.name] = outcome_node
             outcome_node.parent_container = self
             outcome_node.setParentItem(self)
-
             self._reposition_final_outcomes()
             self.auto_resize_for_children()
 
@@ -251,67 +326,54 @@ class ContainerStateNode(QGraphicsRectItem):
         if not self.final_outcomes:
             return
 
-        rect = self.rect()
-        OUTCOME_PADDING_TOP: int = 110
-        OUTCOME_SPACING_Y: int = 300
-
-        max_child_x: float = rect.left() + 500
+        rect = self.get_child_bounds_rect()
+        outcome_padding_top = 110
+        outcome_spacing_y = 300
+        max_child_x = rect.left() + 500
 
         for child in self.child_states.values():
-            if isinstance(child, ContainerStateNode):
-                child.prepareGeometryChange()
-                child_right: float = child.pos().x() + child.rect().width()
-            else:
-                child_right = child.pos().x() + child.boundingRect().width()
+            child_right = (
+                child.pos().x() + child.rect().width()
+                if isinstance(child, ContainerStateNode)
+                else child.pos().x() + child.boundingRect().width()
+            )
             max_child_x = max(max_child_x, child_right)
 
-        outcome_x: float = max_child_x + 300
-        current_y: float = rect.top() + OUTCOME_PADDING_TOP
+        outcome_x = max_child_x + 300
+        current_y = rect.top() + outcome_padding_top
 
-        sorted_outcomes = sorted(self.final_outcomes.items(), key=lambda x: x[0])
-
-        for name, outcome_node in sorted_outcomes:
+        for _name, outcome_node in sorted(self.final_outcomes.items(), key=lambda x: x[0]):
+            if getattr(outcome_node, "_xml_position_loaded", False):
+                continue
             outcome_node.setPos(outcome_x, current_y)
-            current_y += OUTCOME_SPACING_Y
+            current_y += outcome_spacing_y
 
     def auto_resize_for_children(self) -> None:
         if not self.child_states and not self.final_outcomes:
             return
+
         self.prepareGeometryChange()
-        PADDING = [50, 100, 50, 50]  # left, top, right, bottom
+        padding = [50, 100, 50, 50]
         items = list(self.child_states.values()) + list(self.final_outcomes.values())
-        if not items:
-            new_rect = [
-                -self.min_width / 2,
-                -self.min_height / 2,
-                self.min_width,
-                self.min_height,
-            ]
-        else:
-            bounds = [
-                float("inf"),
-                float("inf"),
-                float("-inf"),
-                float("-inf"),
-            ]  # min_x, min_y, max_x, max_y
-            for item in items:
-                pos = item.pos()
-                rect = (
-                    item.rect()
-                    if isinstance(item, ContainerStateNode)
-                    else item.boundingRect()
-                )
-                bounds[0] = min(bounds[0], pos.x() + rect.left())
-                bounds[1] = min(bounds[1], pos.y() + rect.top())
-                bounds[2] = max(bounds[2], pos.x() + rect.right())
-                bounds[3] = max(bounds[3], pos.y() + rect.bottom())
-            new_rect = [
-                bounds[0] - PADDING[0],
-                bounds[1] - PADDING[1],
-                max(bounds[2] - bounds[0] + PADDING[0] + PADDING[2], self.min_width),
-                max(bounds[3] - bounds[1] + PADDING[1] + PADDING[3], self.min_height),
-            ]
-        self.setRect(*new_rect)
+
+        bounds = [float("inf"), float("inf"), float("-inf"), float("-inf")]
+        for item in items:
+            pos = item.pos()
+            rect = item.rect() if isinstance(item, ContainerStateNode) else item.boundingRect()
+            bounds[0] = min(bounds[0], pos.x() + rect.left())
+            bounds[1] = min(bounds[1], pos.y() + rect.top())
+            bounds[2] = max(bounds[2], pos.x() + rect.right())
+            bounds[3] = max(bounds[3], pos.y() + rect.bottom())
+
+        self._content_rect = QRectF(
+            bounds[0] - padding[0],
+            bounds[1] - padding[1],
+            max(bounds[2] - bounds[0] + padding[0] + padding[2], self.min_width),
+            max(bounds[3] - bounds[1] + padding[1] + padding[3], self.min_height),
+        )
+
+        if self.is_concurrence or self._entered:
+            self.setRect(self._content_rect)
         self.update_visual_elements()
         self._update_all_connections_recursive()
         if self.parent_container:
@@ -337,9 +399,11 @@ class ContainerStateNode(QGraphicsRectItem):
         if self.scene() and self.scene().views():
             canvas = self.scene().views()[0]
             if hasattr(canvas, "editor_ref") and canvas.editor_ref:
-                # Select this item first
                 self.setSelected(True)
-                canvas.editor_ref.edit_state()
+                if event.modifiers() & Qt.ControlModifier and not self.is_concurrence:
+                    canvas.editor_ref.enter_container(self, canvas.editor_ref.current_read_only)
+                else:
+                    canvas.editor_ref.edit_state()
                 event.accept()
                 return
         super().mouseDoubleClickEvent(event)
@@ -361,7 +425,7 @@ class ContainerStateNode(QGraphicsRectItem):
                         "Add Concurrence",
                         lambda: canvas.editor_ref.add_concurrence_to_container(),
                     ),
-                    None,  # separator
+                    None,
                     ("Add Final Outcome", lambda: canvas.editor_ref.add_final_outcome()),
                     None,
                     ("Edit Properties", lambda: canvas.editor_ref.edit_state()),
@@ -387,7 +451,6 @@ class ContainerStateNode(QGraphicsRectItem):
         for child in self.child_states.values():
             for connection in child.connections:
                 connection.update_position()
-
             if isinstance(child, ContainerStateNode):
                 child.update_child_connections()
 
@@ -407,7 +470,7 @@ class ContainerStateNode(QGraphicsRectItem):
         """
         if change == QGraphicsItem.ItemPositionChange and isinstance(value, QPointF):
             if self.parent_container:
-                container_rect = self.parent_container.rect()
+                container_rect = self.parent_container.get_child_bounds_rect()
                 self_rect = self.rect()
                 new_pos = value
 
@@ -418,12 +481,10 @@ class ContainerStateNode(QGraphicsRectItem):
 
                 constrained_x = max(min_x, min(new_pos.x(), max_x))
                 constrained_y = max(min_y, min(new_pos.y(), max_y))
-
                 value = QPointF(constrained_x, constrained_y)
 
             for connection in self.connections:
                 connection.update_position()
-
             self.update_child_connections()
 
         elif change == QGraphicsItem.ItemPositionHasChanged:
@@ -431,11 +492,12 @@ class ContainerStateNode(QGraphicsRectItem):
                 self.parent_container.auto_resize_for_children()
 
         elif change == QGraphicsItem.ItemSelectedChange:
-            if value:
+            if self._entered:
+                self.apply_display_mode()
+            elif value:
                 self.setPen(QPen(QColor(255, 200, 0), 4))
             else:
-                color = QColor(255, 140, 0) if self.is_concurrence else QColor(0, 0, 180)
-                self.setPen(QPen(color, 3))
+                self.apply_display_mode()
 
         return super().itemChange(change, value)
 
@@ -484,10 +546,8 @@ class ContainerStateNode(QGraphicsRectItem):
         center = QPointF(center_x, center_y)
 
         angle = math.atan2(target_pos.y() - center.y(), target_pos.x() - center.x())
-
         w = rect.width() / 2
         h = rect.height() / 2
-
         abs_tan = abs(math.tan(angle)) if math.cos(angle) != 0 else float("inf")
         if abs_tan <= h / w:
             x = center.x() + w * (1 if math.cos(angle) > 0 else -1)

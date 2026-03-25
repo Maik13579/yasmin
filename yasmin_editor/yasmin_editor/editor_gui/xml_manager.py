@@ -28,6 +28,20 @@ if TYPE_CHECKING:
 
 
 class XmlManager:
+
+    def _container_key(self, container: ContainerStateNode = None) -> str:
+        if container is None:
+            return ""
+        parts = []
+        current = container
+        while current is not None:
+            parts.append(current.name)
+            current = getattr(current, "parent_container", None)
+        return ".".join(reversed(parts))
+
+    def _state_key(self, state_name: str, parent_container: ContainerStateNode = None) -> str:
+        container_key = self._container_key(parent_container)
+        return f"{container_key}.{state_name}" if container_key else state_name
     def __init__(self, editor: "YasminEditor") -> None:
         self.editor = editor
 
@@ -72,6 +86,17 @@ class XmlManager:
             cont_elem.set("outcomes", " ".join(state_node.final_outcomes.keys()))
         if getattr(state_node, "description", ""):
             cont_elem.set("description", state_node.description)
+        if getattr(state_node, "blackboard_key_metadata", None):
+            keys = []
+            for key_name, metadata in state_node.blackboard_key_metadata.items():
+                keys.append({
+                    "name": key_name,
+                    "key_type": str(metadata.get("key_type", "IN") or "IN"),
+                    "description": str(metadata.get("description", "") or ""),
+                    "default_type": str(metadata.get("default_type", "") or ""),
+                    "default_value": str(metadata.get("default_value", "") or ""),
+                })
+            self.add_blackboard_keys(cont_elem, keys)
         if state_node.remappings:
             self.add_remappings(cont_elem, state_node.remappings)
         if hasattr(state_node, "child_states") and state_node.child_states:
@@ -107,7 +132,7 @@ class XmlManager:
         fsm_description = self.editor.root_sm_description_edit.text().strip()
         if fsm_description:
             root.set("description", fsm_description)
-        self.add_blackboard_keys(root, self.editor.get_blackboard_keys())
+        self.add_blackboard_keys(root, [{"name": k, **v} for k, v in self.editor._blackboard_key_metadata.items()])
         root_level_states = {
             name: node
             for name, node in self.editor.state_nodes.items()
@@ -191,6 +216,7 @@ class XmlManager:
             self.editor.root_sm_name_edit.setText(sm_name)
 
         fsm_description = root.get("description", "")
+        self.editor.root_sm_description = fsm_description
         self.editor.root_sm_description_edit.setText(fsm_description)
 
         self.editor.set_blackboard_keys(self.load_blackboard_keys(root), sync=False)
@@ -263,6 +289,8 @@ class XmlManager:
                     conn.update_position()
 
         self.editor.sync_blackboard_keys()
+
+        self.editor.update_scope_visibility()
 
         for _ in range(3):
             self.editor.canvas.scene.update()
@@ -579,11 +607,10 @@ class XmlManager:
 
         if parent_container is None:
             self.editor.canvas.scene.addItem(node)
-            self.editor.state_nodes[state_name] = node
-
         else:
             parent_container.add_child_state(node)
-            self.editor.state_nodes[f"{parent_container.name}.{state_name}"] = node
+
+        self.editor.state_nodes[self._state_key(state_name, parent_container)] = node
 
     def load_states_from_xml(
         self, parent_elem: ET.Element, parent_container: ContainerStateNode = None
@@ -683,6 +710,16 @@ class XmlManager:
                     description=description,
                     defaults=defaults,
                 )
+                node.blackboard_key_metadata = {
+                    str(key.get("name", "")).strip(): {
+                        "description": str(key.get("description", "") or "").strip(),
+                        "key_type": str(key.get("key_type", "IN") or "IN").strip(),
+                        "default_type": str(key.get("default_type", "") or "").strip(),
+                        "default_value": str(key.get("default_value", "") or "").strip(),
+                    }
+                    for key in self.load_blackboard_keys(elem)
+                    if str(key.get("name", "")).strip()
+                }
 
                 self.add_node_to_editor_or_container(node, state_name, parent_container)
 
@@ -747,6 +784,16 @@ class XmlManager:
                     description=description,
                     defaults=defaults,
                 )
+                node.blackboard_key_metadata = {
+                    str(key.get("name", "")).strip(): {
+                        "description": str(key.get("description", "") or "").strip(),
+                        "key_type": str(key.get("key_type", "IN") or "IN").strip(),
+                        "default_type": str(key.get("default_type", "") or "").strip(),
+                        "default_value": str(key.get("default_value", "") or "").strip(),
+                    }
+                    for key in self.load_blackboard_keys(elem)
+                    if str(key.get("name", "")).strip()
+                }
 
                 self.add_node_to_editor_or_container(node, state_name, parent_container)
 
@@ -862,7 +909,7 @@ class XmlManager:
 
         return parent_container.final_outcomes.get(
             to_name
-        ) or self.editor.state_nodes.get(f"{parent_container.name}.{to_name}")
+        ) or self.editor.state_nodes.get(self._state_key(to_name, parent_container))
 
     def add_connection(
         self, from_node: StateNode, to_node: StateNode, outcome: str
@@ -873,6 +920,37 @@ class XmlManager:
         self.editor.canvas.scene.addItem(connection.label_bg)
         self.editor.canvas.scene.addItem(connection.label)
         self.editor.connections.append(connection)
+
+
+    def _preview_outcome_specs(self, elem: ET.Element) -> list:
+        names = []
+        seen = set()
+
+        for outcome_name in elem.get("outcomes", "").split():
+            if outcome_name and outcome_name not in seen:
+                seen.add(outcome_name)
+                names.append({"name": outcome_name, "description": "", "x": None, "y": None})
+
+        for outcome_elem in elem.findall("FinalOutcome"):
+            outcome_name = outcome_elem.get("name", "")
+            if not outcome_name:
+                continue
+            spec = {
+                "name": outcome_name,
+                "description": outcome_elem.get("description", "") or "",
+                "x": outcome_elem.get("x"),
+                "y": outcome_elem.get("y"),
+            }
+            if outcome_name in seen:
+                for existing in names:
+                    if existing["name"] == outcome_name:
+                        existing.update(spec)
+                        break
+            else:
+                seen.add(outcome_name)
+                names.append(spec)
+
+        return names
 
     def load_transitions_from_xml(
         self,
@@ -885,9 +963,7 @@ class XmlManager:
                 state_name = elem.get("name")
 
                 from_node = self.editor.state_nodes.get(
-                    state_name
-                    if parent_container is None
-                    else f"{parent_container.name}.{state_name}"
+                    self._state_key(state_name, parent_container)
                 )
 
                 if from_node:
@@ -901,11 +977,7 @@ class XmlManager:
                         outcome = transition.get("from")
                         to_name = transition.get("to")
 
-                        from_node_actual = (
-                            from_node.final_outcomes[outcome]
-                            if outcome in final_outcome_names
-                            else from_node
-                        )
+                        from_node_actual = from_node
                         to_node = self.find_to_node(to_name, parent_container)
 
                         if to_node:
@@ -913,9 +985,7 @@ class XmlManager:
 
                 if elem.tag in ["StateMachine", "Concurrence"]:
                     container = self.editor.state_nodes.get(
-                        state_name
-                        if parent_container is None
-                        else f"{parent_container.name}.{state_name}"
+                        self._state_key(state_name, parent_container)
                     )
                     if container:
                         self.load_transitions_from_xml(elem, container)

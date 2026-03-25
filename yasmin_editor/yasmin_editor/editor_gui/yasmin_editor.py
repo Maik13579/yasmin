@@ -15,10 +15,14 @@
 
 import os
 import random
-from typing import Dict, List, Optional, Set
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+from lxml import etree as ET
+from ament_index_python import get_package_share_path
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
+    QGraphicsItem,
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
@@ -37,6 +41,8 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QTextBrowser,
     QAbstractItemView,
+    QSizePolicy,
+    QDialogButtonBox,
 )
 from PyQt5.QtGui import QCloseEvent, QPen, QBrush, QColor
 from PyQt5.QtCore import Qt, QPointF
@@ -83,6 +89,12 @@ class YasminEditor(QMainWindow):
         self._blackboard_keys: List[Dict[str, str]] = []
         self._blackboard_key_metadata: Dict[str, Dict[str, str]] = {}
         self._highlight_blackboard_usage = True
+        self.root_sm_description = ""
+        self.current_container: Optional[ContainerStateNode] = None
+        self.current_read_only: bool = False
+        self.preview_root_container: Optional[ContainerStateNode] = None
+        self.preview_items: List[object] = []
+        self.navigation_path: List[Tuple[str, Optional[ContainerStateNode], bool]] = [("root", None, False)]
 
         self.layout_seed = 42
         self.layout_rng = random.Random(self.layout_seed)
@@ -256,11 +268,24 @@ class YasminEditor(QMainWindow):
         root_sm_row2.addWidget(QLabel("<b>Description:</b>"))
         self.root_sm_description_edit = QLineEdit()
         self.root_sm_description_edit.setPlaceholderText("Enter FSM description...")
+        self.root_sm_description_edit.textChanged.connect(self.on_root_sm_description_changed)
         root_sm_row2.addWidget(self.root_sm_description_edit)
 
         root_sm_vlayout.addLayout(root_sm_row2)
 
         right_layout.addWidget(root_sm_widget)
+
+        self.navigator_widget = QWidget()
+        self.navigator_layout = QHBoxLayout(self.navigator_widget)
+        self.navigator_layout.setContentsMargins(0, 0, 0, 0)
+        self.navigator_layout.setSpacing(4)
+        self.nav_up_button = QPushButton("↑")
+        self.nav_up_button.setFixedWidth(32)
+        self.nav_up_button.clicked.connect(self.navigate_up)
+        self.navigator_layout.addWidget(self.nav_up_button)
+        self.navigator_layout.addStretch(1)
+        right_layout.addWidget(self.navigator_widget)
+        self.update_navigation_ui()
 
         canvas_header = QLabel(
             "<b>State Machine Canvas:</b> "
@@ -310,7 +335,34 @@ class YasminEditor(QMainWindow):
         Args:
             text: The new state machine name.
         """
+        if self.current_read_only:
+            return
+        if self.current_container is not None:
+            self.current_container.name = text
+            self.current_container.apply_display_mode()
+            self.update_navigation_ui()
+            self._rebuild_state_node_index()
+            return
         self.root_sm_name = text
+
+    def on_root_sm_description_changed(self, text: str) -> None:
+        if self.current_read_only:
+            return
+        if self.current_container is not None:
+            self.current_container.description = text
+        else:
+            self.root_sm_description = text
+
+    def _get_metadata_owner(self) -> Optional[ContainerStateNode]:
+        return self.current_container
+
+    def _get_active_blackboard_metadata(self) -> Dict[str, Dict[str, str]]:
+        owner = self._get_metadata_owner()
+        if owner is None:
+            return self._blackboard_key_metadata
+        if not hasattr(owner, 'blackboard_key_metadata'):
+            owner.blackboard_key_metadata = {}
+        return owner.blackboard_key_metadata
 
     def on_start_state_changed(self, text: str) -> None:
         """Handle initial state selection change.
@@ -318,11 +370,299 @@ class YasminEditor(QMainWindow):
         Args:
             text: The selected state name or "(None)".
         """
+        if self.current_read_only:
+            return
+
+        active_container = self.current_container
+        if active_container is not None:
+            active_container.start_state = None if text == "(None)" else text
+            active_container.update_start_state_label()
+            return
+
         if text == "(None)":
             self.start_state = None
         else:
             self.start_state = text
 
+    def _get_container_path(self, container: ContainerStateNode) -> str:
+        parts: List[str] = []
+        current = container
+        while current is not None:
+            parts.append(current.name)
+            current = getattr(current, "parent_container", None)
+        return ".".join(reversed(parts))
+
+    def _get_active_edit_container(self) -> Optional[ContainerStateNode]:
+        if self.current_read_only:
+            return None
+        return self.current_container
+
+    def _get_scope_container(self) -> Optional[ContainerStateNode]:
+        return self.current_container or self.preview_root_container
+
+    def _get_scope_owner(self, item) -> Optional[ContainerStateNode]:
+        return getattr(item, "parent_container", None)
+
+    def _get_scope_connection_visibility(self, connection: ConnectionLine) -> bool:
+        scope_container = self._get_scope_container()
+        from_owner = self._get_scope_owner(connection.from_node)
+        to_owner = self._get_scope_owner(connection.to_node)
+        return from_owner == scope_container and to_owner == scope_container
+
+    def _set_connection_visible(self, connection: ConnectionLine, visible: bool) -> None:
+        connection.setVisible(visible)
+        connection.arrow_head.setVisible(visible)
+        connection.label_bg.setVisible(visible)
+        connection.label.setVisible(visible)
+
+    def _set_ancestor_chain_visible(self, container: Optional[ContainerStateNode]) -> None:
+        current = container
+        while current is not None:
+            current.setVisible(True)
+            if current.is_state_machine:
+                current.set_entered(True)
+            current = getattr(current, "parent_container", None)
+
+    def _iter_scope_state_nodes_recursive(self, container: Optional[ContainerStateNode]) -> List[StateNode]:
+        if container is None:
+            return self._get_scope_nodes()
+        return list(container.child_states.values())
+
+    def _set_dialog_read_only(self, dialog: QDialog) -> None:
+        dialog.setWindowTitle(f"{dialog.windowTitle()} (Read Only)")
+
+        for child in dialog.findChildren(QWidget):
+            if isinstance(child, QTextBrowser):
+                continue
+            if isinstance(child, QDialogButtonBox):
+                ok_button = child.button(QDialogButtonBox.Ok)
+                if ok_button is not None:
+                    ok_button.hide()
+                cancel_button = child.button(QDialogButtonBox.Cancel)
+                if cancel_button is not None:
+                    cancel_button.setText("Close")
+                continue
+            if hasattr(child, "setReadOnly"):
+                try:
+                    child.setReadOnly(True)
+                    continue
+                except Exception:
+                    pass
+            if hasattr(child, "setEnabled"):
+                try:
+                    child.setEnabled(False)
+                except Exception:
+                    pass
+
+    def _is_outcome_used(self, from_node, outcome: str) -> bool:
+        for connection in getattr(from_node, "connections", []):
+            if connection.from_node == from_node and connection.outcome == outcome:
+                return True
+        return False
+
+    def _get_scope_nodes(self) -> List[StateNode]:
+        if self.preview_root_container is not None and self.current_container is None:
+            return list(self.preview_root_container.child_states.values())
+        if self.current_container is None:
+            return [
+                node
+                for node in self.state_nodes.values()
+                if getattr(node, "parent_container", None) is None
+            ]
+        return list(self.current_container.child_states.values())
+
+    def _get_scope_final_outcomes(self) -> List[FinalOutcomeNode]:
+        if self.preview_root_container is not None and self.current_container is None:
+            return list(self.preview_root_container.final_outcomes.values())
+        if self.current_container is None:
+            return list(self.final_outcomes.values())
+        return list(self.current_container.final_outcomes.values())
+
+    def _find_state_node_key(self, state_node) -> Optional[str]:
+        for key, node in self.state_nodes.items():
+            if node is state_node:
+                return key
+        return None
+
+    def _iter_root_state_nodes(self) -> List[StateNode]:
+        roots: List[StateNode] = []
+        seen = set()
+        for node in self.state_nodes.values():
+            if getattr(node, "parent_container", None) is None and id(node) not in seen:
+                roots.append(node)
+                seen.add(id(node))
+        return roots
+
+    def _rebuild_state_node_index(self) -> None:
+        new_index = {}
+
+        def visit(node, prefix: str = "") -> None:
+            key = f"{prefix}.{node.name}" if prefix else node.name
+            new_index[key] = node
+            if isinstance(node, ContainerStateNode):
+                for child in node.child_states.values():
+                    visit(child, key)
+
+        for root_node in self._iter_root_state_nodes():
+            visit(root_node)
+
+        self.state_nodes = new_index
+
+    def update_navigation_ui(self) -> None:
+        while self.navigator_layout.count() > 2:
+            item = self.navigator_layout.takeAt(1)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        insert_index = 1
+        for index, (label, _container, _readonly) in enumerate(self.navigation_path):
+            button = QPushButton(label)
+            button.setFlat(True)
+            button.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+            button.clicked.connect(
+                lambda _checked=False, idx=index: self.navigate_to_index(idx)
+            )
+            self.navigator_layout.insertWidget(insert_index, button)
+            insert_index += 1
+            if index < len(self.navigation_path) - 1:
+                self.navigator_layout.insertWidget(insert_index, QLabel('>'))
+                insert_index += 1
+
+        self.nav_up_button.setEnabled(len(self.navigation_path) > 1)
+
+
+    def _apply_scope_item_flags(self) -> None:
+        editable = not self.current_read_only
+        scope_container = self._get_scope_container()
+        for node in self.state_nodes.values():
+            if node.isVisible():
+                is_scope_container = node is scope_container
+                node.setFlag(QGraphicsItem.ItemIsMovable, editable and not is_scope_container)
+                node.setFlag(QGraphicsItem.ItemIsSelectable, not is_scope_container)
+        for outcome in self.final_outcomes.values():
+            if outcome.isVisible():
+                outcome.setFlag(QGraphicsItem.ItemIsMovable, editable)
+                outcome.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        for item in self.preview_items:
+            if isinstance(item, (StateNode, ContainerStateNode, FinalOutcomeNode)) and item.isVisible():
+                is_scope_container = item is scope_container
+                item.setFlag(QGraphicsItem.ItemIsMovable, editable and not is_scope_container)
+                item.setFlag(QGraphicsItem.ItemIsSelectable, not is_scope_container or isinstance(item, FinalOutcomeNode))
+        if scope_container is not None:
+            scope_container.setFlag(QGraphicsItem.ItemIsSelectable, False)
+            scope_container.setFlag(QGraphicsItem.ItemIsMovable, False)
+            scope_container.setSelected(False)
+
+    def update_scope_header(self) -> None:
+        container = self.current_container
+        self.root_sm_name_edit.blockSignals(True)
+        self.root_sm_description_edit.blockSignals(True)
+        self.start_state_combo.blockSignals(True)
+        if container is None:
+            self.root_sm_name_edit.setText(self.root_sm_name)
+            self.root_sm_description_edit.setText(self.root_sm_description)
+            self.root_sm_name_edit.setReadOnly(False)
+            self.root_sm_description_edit.setReadOnly(False)
+        else:
+            self.root_sm_name_edit.setText(container.name)
+            self.root_sm_description_edit.setText(getattr(container, 'description', ''))
+            self.root_sm_name_edit.setReadOnly(self.current_read_only)
+            self.root_sm_description_edit.setReadOnly(self.current_read_only)
+        self.start_state_combo.setEnabled(not self.current_read_only)
+        self.start_state_combo.blockSignals(False)
+        self.root_sm_description_edit.blockSignals(False)
+        self.root_sm_name_edit.blockSignals(False)
+    def navigate_to_index(self, index: int) -> None:
+        if index < 0 or index >= len(self.navigation_path):
+            return
+
+        self.navigation_path = self.navigation_path[: index + 1]
+        _label, container, readonly = self.navigation_path[-1]
+
+        if self.preview_root_container is not None and container is None and index == 0:
+            self.clear_preview_scope()
+        else:
+            self.current_container = container
+            self.current_read_only = readonly
+
+        self.update_navigation_ui()
+        self.update_start_state_combo()
+        self.update_scope_header()
+        self.update_scope_visibility()
+        self.sync_blackboard_keys()
+
+    def navigate_up(self) -> None:
+        if len(self.navigation_path) <= 1:
+            return
+        self.navigate_to_index(len(self.navigation_path) - 2)
+
+    def _set_item_visible_recursive(self, item, visible: bool) -> None:
+        item.setVisible(visible)
+        if isinstance(item, ContainerStateNode):
+            for child in item.child_states.values():
+                self._set_item_visible_recursive(child, visible)
+            for outcome in item.final_outcomes.values():
+                self._set_item_visible_recursive(outcome, visible)
+
+    def update_scope_visibility(self) -> None:
+        for node in self.state_nodes.values():
+            if getattr(node, "parent_container", None) is None:
+                self._set_item_visible_recursive(node, False)
+        for outcome in self.final_outcomes.values():
+            outcome.setVisible(False)
+
+        if self.preview_root_container is not None:
+            self._set_item_visible_recursive(self.preview_root_container, False)
+
+        all_containers = [
+            node for node in self.state_nodes.values() if isinstance(node, ContainerStateNode)
+        ]
+        all_containers.extend(
+            [item for item in self.preview_items if isinstance(item, ContainerStateNode)]
+        )
+
+        for container in all_containers:
+            container.set_entered(False)
+            container.setSelected(False)
+            if container is not self.current_container:
+                container.setVisible(False)
+
+        for connection in self.connections:
+            self._set_connection_visible(connection, False)
+        for item in self.preview_items:
+            if isinstance(item, ConnectionLine):
+                self._set_connection_visible(item, False)
+
+        scope_container = self._get_scope_container()
+
+        if scope_container is None:
+            for node in self._get_scope_nodes():
+                node.setVisible(True)
+            for outcome in self._get_scope_final_outcomes():
+                outcome.setVisible(True)
+        else:
+            scope_container.setVisible(True)
+            scope_container.setSelected(False)
+            scope_container.setFlag(QGraphicsItem.ItemIsSelectable, False)
+            if scope_container.is_state_machine:
+                scope_container.set_entered(True)
+            for node in scope_container.child_states.values():
+                node.setVisible(True)
+                node.setSelected(False)
+            for outcome in scope_container.final_outcomes.values():
+                outcome.setVisible(True)
+                outcome.setSelected(False)
+
+        for connection in self.connections:
+            self._set_connection_visible(connection, self._get_scope_connection_visibility(connection))
+        for item in self.preview_items:
+            if isinstance(item, ConnectionLine):
+                self._set_connection_visible(item, self._get_scope_connection_visibility(item))
+
+        self.canvas.scene.clearSelection()
+        self._apply_scope_item_flags()
+        self.canvas.scene.update()
     def filter_blackboard_keys(self, text: str) -> None:
         """Filter blackboard keys based on search text."""
         for i in range(self.blackboard_list.count()):
@@ -360,7 +700,7 @@ class YasminEditor(QMainWindow):
     def _collect_blackboard_key_usage(self) -> Dict[str, Dict[str, str]]:
         usage_map: Dict[str, Dict[str, object]] = {}
 
-        for state_node in self.state_nodes.values():
+        for state_node in self._iter_scope_state_nodes_recursive(self._get_scope_container()):
             plugin_info = getattr(state_node, "plugin_info", None)
             if plugin_info is None:
                 continue
@@ -399,7 +739,7 @@ class YasminEditor(QMainWindow):
 
         derived_keys: Dict[str, Dict[str, str]] = {}
         for key_name, usage in usage_map.items():
-            metadata = dict(self._blackboard_key_metadata.get(key_name, {}))
+            metadata = dict(self._get_active_blackboard_metadata().get(key_name, {}))
             if usage["input"] and usage["output"]:
                 key_type = "IN/OUT"
             elif usage["output"]:
@@ -431,15 +771,19 @@ class YasminEditor(QMainWindow):
     def sync_blackboard_keys(self) -> None:
         derived_keys = self._collect_blackboard_key_usage()
         used_key_names = set(derived_keys.keys())
-        self._blackboard_key_metadata = {
-            key_name: metadata
-            for key_name, metadata in self._blackboard_key_metadata.items()
+        metadata = self._get_active_blackboard_metadata()
+        filtered_metadata = {
+            key_name: value
+            for key_name, value in metadata.items()
             if key_name in used_key_names
         }
+        metadata.clear()
+        metadata.update(filtered_metadata)
         self._blackboard_keys = list(derived_keys.values())
         self.refresh_blackboard_keys_list()
 
     def refresh_blackboard_keys_list(self) -> None:
+        self._blackboard_keys = list(self._collect_blackboard_key_usage().values())
         current_key_name = self.get_selected_blackboard_key_name()
         self.blackboard_list.clear()
 
@@ -485,7 +829,8 @@ class YasminEditor(QMainWindow):
         if not key_name:
             return
 
-        metadata = dict(self._blackboard_key_metadata.get(key_name, {}))
+        active_metadata = self._get_active_blackboard_metadata()
+        metadata = dict(active_metadata.get(key_name, {}))
         merged_key_data = {
             **key_data,
             **metadata,
@@ -496,9 +841,14 @@ class YasminEditor(QMainWindow):
         }
 
         dlg = BlackboardKeyDialog(merged_key_data, parent=self, edit_mode=True)
+        if self.current_read_only:
+            self._set_dialog_read_only(dlg)
+            dlg.exec_()
+            return
+
         if dlg.exec_():
             updated_key = dlg.get_key_data()
-            self._blackboard_key_metadata[key_name] = {
+            active_metadata[key_name] = {
                 "description": updated_key.get("description", ""),
                 "key_type": key_data.get("key_type", "IN"),
                 "default_type": updated_key.get("default_type", ""),
@@ -522,7 +872,8 @@ class YasminEditor(QMainWindow):
             self.sync_blackboard_keys()
 
     def get_blackboard_keys(self) -> List[Dict[str, str]]:
-        self.sync_blackboard_keys()
+        self._blackboard_keys = list(self._collect_blackboard_key_usage().values())
+        self.refresh_blackboard_keys_list()
         return [dict(key) for key in self._blackboard_keys]
 
     def add_root_default_row(self) -> None:
@@ -579,6 +930,12 @@ class YasminEditor(QMainWindow):
             del self.state_nodes[full_name]
 
     def state_uses_blackboard_key(self, state_node, key_name: str) -> bool:
+        if isinstance(state_node, ContainerStateNode):
+            for child_state in state_node.child_states.values():
+                if self.state_uses_blackboard_key(child_state, key_name):
+                    return True
+            return False
+
         plugin_info = getattr(state_node, "plugin_info", None)
         if plugin_info is None:
             return False
@@ -612,12 +969,12 @@ class YasminEditor(QMainWindow):
                 else QPen(QColor(0, 0, 180), 3)
             )
         elif isinstance(item, ContainerStateNode):
-            if item.is_concurrence:
-                item.setBrush(QBrush(QColor(255, 220, 150, 180)))
-                item.setPen(QPen(QColor(255, 140, 0), 3))
-            else:
-                item.setBrush(QBrush(QColor(173, 216, 230, 180)))
-                item.setPen(QPen(QColor(0, 0, 180), 3))
+            item.apply_display_mode()
+            if item.is_entered():
+                item.setBrush(QBrush(Qt.NoBrush))
+                item.setPen(QPen(Qt.NoPen))
+            elif is_selected:
+                item.setPen(QPen(QColor(255, 200, 0), 4))
         elif isinstance(item, FinalOutcomeNode):
             item.setBrush(QBrush(QColor(255, 0, 0)))
             item.setPen(
@@ -627,24 +984,41 @@ class YasminEditor(QMainWindow):
     def update_blackboard_usage_highlighting(self) -> None:
         selected_key = self.get_selected_blackboard_key_name()
 
-        for state_node in self.state_nodes.values():
+        scope_container = self._get_scope_container()
+        visible_nodes = [
+            node
+            for node in self.state_nodes.values()
+            if node.isVisible() and node is not scope_container
+        ]
+        for state_node in visible_nodes:
             self.apply_default_visual_state(state_node)
 
         if not self._highlight_blackboard_usage or not selected_key:
             return
 
-        for state_node in self.state_nodes.values():
+        for state_node in visible_nodes:
             if self.state_uses_blackboard_key(state_node, selected_key):
                 state_node.setPen(QPen(QColor(255, 170, 0), 5))
-                state_node.setBrush(QBrush(QColor(255, 255, 170)))
+                if not isinstance(state_node, ContainerStateNode):
+                    state_node.setBrush(QBrush(QColor(255, 255, 170)))
 
     def update_start_state_combo(self) -> None:
         """Update the initial state combo box with available states."""
-        current = self.start_state
+        active_container = self.current_container
+        current = active_container.start_state if active_container is not None else self.start_state
+        self.start_state_combo.blockSignals(True)
         self.start_state_combo.clear()
         self.start_state_combo.addItem("(None)")
 
-        for state_name in self.state_nodes.keys():
+        if active_container is not None:
+            state_names = list(active_container.child_states.keys())
+        else:
+            state_names = [
+                node.name
+                for node in self._iter_root_state_nodes()
+            ]
+
+        for state_name in state_names:
             self.start_state_combo.addItem(state_name)
 
         if current:
@@ -652,10 +1026,14 @@ class YasminEditor(QMainWindow):
             if index >= 0:
                 self.start_state_combo.setCurrentIndex(index)
             else:
-                self.start_state = None
+                if active_container is not None:
+                    active_container.start_state = None
+                else:
+                    self.start_state = None
                 self.start_state_combo.setCurrentIndex(0)
         else:
             self.start_state_combo.setCurrentIndex(0)
+        self.start_state_combo.blockSignals(False)
 
     def on_plugin_double_clicked(self, item: QListWidgetItem) -> None:
         """Handle double-click on a plugin item to add it as a state.
@@ -681,6 +1059,372 @@ class YasminEditor(QMainWindow):
         if ok:
             self.create_state_node(state_name, xml_plugin, False, False)
 
+    def enter_container(self, container: ContainerStateNode, read_only: bool = False) -> None:
+        self.canvas.scene.clearSelection()
+        container.setSelected(False)
+        self.current_container = container
+        self.current_read_only = read_only
+        self.navigation_path.append((container.name, container, read_only))
+        self.update_navigation_ui()
+        self.update_start_state_combo()
+        self.update_scope_header()
+        self.update_scope_visibility()
+        self.sync_blackboard_keys()
+
+    def _find_xml_file_path(self, plugin_info: PluginInfo) -> Optional[str]:
+        if (
+            plugin_info.plugin_type != "xml"
+            or not plugin_info.file_name
+            or not plugin_info.package_name
+        ):
+            return None
+
+        package_path = Path(get_package_share_path(plugin_info.package_name))
+        for file_path in package_path.rglob(plugin_info.file_name):
+            return str(file_path)
+        return None
+
+    def clear_preview_scope(self) -> None:
+        for item in reversed(list(self.preview_items)):
+            try:
+                if hasattr(item, "scene") and item.scene() is self.canvas.scene:
+                    self.canvas.scene.removeItem(item)
+            except Exception:
+                pass
+        self.preview_items = []
+        self.preview_root_container = None
+        self.current_container = None
+        self.current_read_only = False
+        self.navigation_path = [("root", None, False)]
+        self.update_scope_header()
+        self.update_start_state_combo()
+
+    def _create_preview_connection(self, from_node, to_node, outcome: str) -> None:
+        connection = ConnectionLine(from_node, to_node, outcome)
+        self.canvas.scene.addItem(connection)
+        self.canvas.scene.addItem(connection.arrow_head)
+        self.canvas.scene.addItem(connection.label_bg)
+        self.canvas.scene.addItem(connection.label)
+        self.preview_items.extend(
+            [connection, connection.arrow_head, connection.label_bg, connection.label]
+        )
+
+    def _build_preview_container(
+        self, parent_elem: ET.Element, name: str
+    ) -> ContainerStateNode:
+        preview_container = ContainerStateNode(
+            name,
+            0,
+            0,
+            False,
+            {},
+            parent_elem.get("outcomes", "").split()
+            if parent_elem.get("outcomes")
+            else [],
+            parent_elem.get("start_state"),
+            None,
+            parent_elem.get("description", ""),
+            [],
+        )
+        self.canvas.scene.addItem(preview_container)
+        self.preview_items.append(preview_container)
+        local_nodes = {}
+
+        for elem in parent_elem:
+            is_xml_plugin_state = elem.tag == "StateMachine" and elem.get("file_name")
+            is_regular_state = elem.tag == "State"
+            if is_regular_state or is_xml_plugin_state:
+                state_name = elem.get("name", "")
+                state_type = elem.get("type", "py")
+                plugin_info = None
+                if state_type == "py":
+                    plugin_info = next(
+                        (
+                            p
+                            for p in self.plugin_manager.python_plugins
+                            if p.module == elem.get("module")
+                            and p.class_name == elem.get("class")
+                        ),
+                        None,
+                    )
+                elif state_type == "cpp":
+                    plugin_info = next(
+                        (
+                            p
+                            for p in self.plugin_manager.cpp_plugins
+                            if p.class_name == elem.get("class")
+                        ),
+                        None,
+                    )
+                elif state_type == "xml":
+                    plugin_info = next(
+                        (
+                            p
+                            for p in self.plugin_manager.xml_files
+                            if p.file_name == elem.get("file_name")
+                            and (
+                                elem.get("package") is None
+                                or p.package_name == elem.get("package")
+                            )
+                        ),
+                        None,
+                    )
+                if plugin_info is None:
+                    continue
+                node = StateNode(
+                    state_name,
+                    plugin_info,
+                    0,
+                    0,
+                    {},
+                    elem.get("description", ""),
+                    [],
+                )
+                preview_container.add_child_state(node)
+                self.preview_items.append(node)
+                local_nodes[state_name] = node
+            elif elem.tag == "StateMachine" and not elem.get("file_name"):
+                state_name = elem.get("name", "")
+                node = ContainerStateNode(
+                    state_name,
+                    0,
+                    0,
+                    False,
+                    {},
+                    elem.get("outcomes", "").split()
+                    if elem.get("outcomes")
+                    else [],
+                    elem.get("start_state"),
+                    None,
+                    elem.get("description", ""),
+                    [],
+                )
+                preview_container.add_child_state(node)
+                self.preview_items.append(node)
+                local_nodes[state_name] = node
+                self._fill_preview_container(node, elem)
+            elif elem.tag == "Concurrence":
+                state_name = elem.get("name", "")
+                node = ContainerStateNode(
+                    state_name,
+                    0,
+                    0,
+                    True,
+                    {},
+                    elem.get("outcomes", "").split()
+                    if elem.get("outcomes")
+                    else [],
+                    None,
+                    elem.get("default_outcome"),
+                    elem.get("description", ""),
+                    [],
+                )
+                preview_container.add_child_state(node)
+                self.preview_items.append(node)
+                local_nodes[state_name] = node
+                self._fill_preview_container(node, elem)
+
+        for outcome_spec in self.xml_manager._preview_outcome_specs(parent_elem):
+            outcome_node = FinalOutcomeNode(
+                outcome_spec["name"],
+                0,
+                0,
+                inside_container=True,
+                description=outcome_spec.get("description", ""),
+            )
+            preview_container.add_final_outcome(outcome_node)
+            x = outcome_spec.get("x")
+            y = outcome_spec.get("y")
+            if x is not None and y is not None:
+                try:
+                    outcome_node.setPos(float(x), float(y))
+                    outcome_node._xml_position_loaded = True
+                except ValueError:
+                    outcome_node._xml_position_loaded = False
+            self.preview_items.append(outcome_node)
+        preview_container.blackboard_key_metadata = {
+            str(key.get("name", "")).strip(): {
+                "description": str(key.get("description", "") or "").strip(),
+                "key_type": str(key.get("key_type", "IN") or "IN").strip(),
+                "default_type": str(key.get("default_type", "") or "").strip(),
+                "default_value": str(key.get("default_value", "") or "").strip(),
+            }
+            for key in self.xml_manager.load_blackboard_keys(parent_elem)
+            if str(key.get("name", "")).strip()
+        } if hasattr(self, 'xml_manager') else {}
+        self._fill_preview_connections(preview_container, parent_elem, local_nodes)
+        preview_container.auto_resize_for_children()
+        return preview_container
+
+    def _fill_preview_container(
+        self, preview_container: ContainerStateNode, parent_elem: ET.Element
+    ) -> None:
+        local_nodes = {}
+        for elem in parent_elem:
+            is_xml_plugin_state = elem.tag == "StateMachine" and elem.get("file_name")
+            is_regular_state = elem.tag == "State"
+            if is_regular_state or is_xml_plugin_state:
+                state_name = elem.get("name", "")
+                state_type = elem.get("type", "py")
+                plugin_info = None
+                if state_type == "py":
+                    plugin_info = next(
+                        (
+                            p
+                            for p in self.plugin_manager.python_plugins
+                            if p.module == elem.get("module")
+                            and p.class_name == elem.get("class")
+                        ),
+                        None,
+                    )
+                elif state_type == "cpp":
+                    plugin_info = next(
+                        (
+                            p
+                            for p in self.plugin_manager.cpp_plugins
+                            if p.class_name == elem.get("class")
+                        ),
+                        None,
+                    )
+                elif state_type == "xml":
+                    plugin_info = next(
+                        (
+                            p
+                            for p in self.plugin_manager.xml_files
+                            if p.file_name == elem.get("file_name")
+                            and (
+                                elem.get("package") is None
+                                or p.package_name == elem.get("package")
+                            )
+                        ),
+                        None,
+                    )
+                if plugin_info is None:
+                    continue
+                node = StateNode(
+                    state_name,
+                    plugin_info,
+                    0,
+                    0,
+                    {},
+                    elem.get("description", ""),
+                    [],
+                )
+                preview_container.add_child_state(node)
+                self.preview_items.append(node)
+                local_nodes[state_name] = node
+            elif elem.tag == "StateMachine" and not elem.get("file_name"):
+                state_name = elem.get("name", "")
+                node = ContainerStateNode(
+                    state_name,
+                    0,
+                    0,
+                    False,
+                    {},
+                    elem.get("outcomes", "").split()
+                    if elem.get("outcomes")
+                    else [],
+                    elem.get("start_state"),
+                    None,
+                    elem.get("description", ""),
+                    [],
+                )
+                preview_container.add_child_state(node)
+                self.preview_items.append(node)
+                local_nodes[state_name] = node
+                self._fill_preview_container(node, elem)
+            elif elem.tag == "Concurrence":
+                state_name = elem.get("name", "")
+                node = ContainerStateNode(
+                    state_name,
+                    0,
+                    0,
+                    True,
+                    {},
+                    elem.get("outcomes", "").split()
+                    if elem.get("outcomes")
+                    else [],
+                    None,
+                    elem.get("default_outcome"),
+                    elem.get("description", ""),
+                    [],
+                )
+                preview_container.add_child_state(node)
+                self.preview_items.append(node)
+                local_nodes[state_name] = node
+                self._fill_preview_container(node, elem)
+
+        for outcome_spec in self.xml_manager._preview_outcome_specs(parent_elem):
+            outcome_node = FinalOutcomeNode(
+                outcome_spec["name"],
+                0,
+                0,
+                inside_container=True,
+                description=outcome_spec.get("description", ""),
+            )
+            preview_container.add_final_outcome(outcome_node)
+            x = outcome_spec.get("x")
+            y = outcome_spec.get("y")
+            if x is not None and y is not None:
+                try:
+                    outcome_node.setPos(float(x), float(y))
+                    outcome_node._xml_position_loaded = True
+                except ValueError:
+                    outcome_node._xml_position_loaded = False
+            self.preview_items.append(outcome_node)
+
+        self._fill_preview_connections(preview_container, parent_elem, local_nodes)
+        preview_container.auto_resize_for_children()
+
+    def _fill_preview_connections(
+        self,
+        preview_container: ContainerStateNode,
+        parent_elem: ET.Element,
+        local_nodes: Dict[str, object],
+    ) -> None:
+        for elem in parent_elem:
+            if elem.tag not in ["State", "StateMachine", "Concurrence"]:
+                continue
+            from_node = local_nodes.get(elem.get("name", ""))
+            if from_node is None:
+                continue
+            final_outcome_names = (
+                set(from_node.final_outcomes.keys())
+                if isinstance(from_node, ContainerStateNode)
+                else set()
+            )
+            for transition in elem.findall("Transition"):
+                outcome = transition.get("from", "")
+                target_name = transition.get("to", "")
+                source_node = from_node
+                target_node = (
+                    local_nodes.get(target_name)
+                    or preview_container.final_outcomes.get(target_name)
+                )
+                if target_node is not None:
+                    self._create_preview_connection(source_node, target_node, outcome)
+
+    def enter_xml_preview(self, state_node: StateNode) -> None:
+        xml_path = self._find_xml_file_path(state_node.plugin_info)
+        if xml_path is None:
+            return
+        self.clear_preview_scope()
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        self.preview_root_container = self._build_preview_container(
+            root, root.get("name", state_node.name)
+        )
+        self.preview_root_container.setSelected(False)
+        self.preview_root_container.set_entered(True)
+        self.current_container = self.preview_root_container
+        self.current_read_only = True
+        self.navigation_path = [("root", None, False), (state_node.name, self.preview_root_container, True)]
+        self.update_navigation_ui()
+        self.update_start_state_combo()
+        self.update_scope_header()
+        self.update_scope_visibility()
+        self.sync_blackboard_keys()
+
     def get_free_position(self) -> QPointF:
         """Get a free position in a deterministic grid layout.
 
@@ -691,6 +1435,19 @@ class YasminEditor(QMainWindow):
         Returns:
             QPointF: The calculated free position for a new node.
         """
+        active_container = self._get_active_edit_container()
+        if active_container is not None:
+            item_count = len(active_container.child_states) + len(active_container.final_outcomes)
+            rect = active_container.get_child_bounds_rect()
+            start_x = rect.left() + 120
+            start_y = rect.top() + 140
+            node_width = 340
+            node_height = 240
+            nodes_per_row = 3
+            row = item_count // nodes_per_row
+            col = item_count % nodes_per_row
+            return QPointF(start_x + (col * node_width), start_y + (row * node_height))
+
         START_X = 100
         START_Y = 100
         NODE_WIDTH = 400
@@ -743,8 +1500,17 @@ class YasminEditor(QMainWindow):
             QMessageBox.warning(self, "Validation Error", "Name is required!")
             return
 
-        if name in self.state_nodes:
+        active_container = self._get_active_edit_container()
+        if active_container is None and name in [node.name for node in self._iter_root_state_nodes()]:
             QMessageBox.warning(self, "Error", f"State '{name}' already exists!")
+            return
+
+        if active_container is not None and name in active_container.child_states:
+            QMessageBox.warning(
+                self,
+                "Error",
+                f"State '{name}' already exists in this container!",
+            )
             return
 
         pos = self.get_free_position()
@@ -774,20 +1540,35 @@ class YasminEditor(QMainWindow):
             )
 
         self.canvas.scene.addItem(node)
-        self.state_nodes[name] = node
+
+        if active_container is not None:
+            active_container.add_child_state(node)
+            self._rebuild_state_node_index()
+            if active_container.is_state_machine and len(active_container.child_states) == 1:
+                active_container.start_state = name
+                active_container.update_start_state_label()
+        else:
+            self.state_nodes[name] = node
+            self._rebuild_state_node_index()
+            self.update_start_state_combo()
+
+            if len(
+                [node for node in self.state_nodes.values() if getattr(node, "parent_container", None) is None]
+            ) == 1 and not self.start_state:
+                self.start_state = name
+                index = self.start_state_combo.findText(name)
+                if index >= 0:
+                    self.start_state_combo.setCurrentIndex(index)
+
         self.update_start_state_combo()
-
-        if len(self.state_nodes) == 1 and not self.start_state:
-            self.start_state = name
-            index = self.start_state_combo.findText(name)
-            if index >= 0:
-                self.start_state_combo.setCurrentIndex(index)
-
+        self.update_scope_visibility()
         self.sync_blackboard_keys()
         self.statusBar().showMessage(f"Added state: {name}", 2000)
 
     def add_state(self) -> None:
         """Open dialog to add a new state to the state machine."""
+        if self.current_read_only:
+            return
         all_plugins = (
             self.plugin_manager.python_plugins
             + self.plugin_manager.cpp_plugins
@@ -809,6 +1590,8 @@ class YasminEditor(QMainWindow):
 
     def add_container(self, is_concurrence: bool = False) -> None:
         """Add a new container (State Machine or Concurrence)."""
+        if self.current_read_only:
+            return
         dialog = (
             ConcurrenceDialog(parent=self)
             if is_concurrence
@@ -845,6 +1628,8 @@ class YasminEditor(QMainWindow):
 
     def edit_state(self) -> None:
         """Edit properties of the selected state."""
+        read_only = self.current_read_only
+
         selected_items = self.canvas.scene.selectedItems()
         state_node = None
 
@@ -861,33 +1646,36 @@ class YasminEditor(QMainWindow):
 
         if isinstance(state_node, ContainerStateNode):
             if state_node.is_state_machine:
-                child_state_names = list(state_node.child_states.keys())
-
-                dialog = StateMachineDialog(
-                    name=state_node.name,
-                    outcomes=(
-                        list(state_node.final_outcomes.keys())
-                        if state_node.final_outcomes
-                        else []
-                    ),
-                    start_state=state_node.start_state,
+                dialog = StatePropertiesDialog(
+                    state_name=state_node.name,
+                    plugin_info=None,
+                    available_plugins=[],
                     remappings=state_node.remappings,
-                    child_states=child_state_names,
+                    outcomes=list(state_node.final_outcomes.keys()) if state_node.final_outcomes else [],
                     edit_mode=True,
                     parent=self,
                     description=getattr(state_node, "description", ""),
                     defaults=getattr(state_node, "defaults", []),
                 )
 
+                if read_only:
+                    self._set_dialog_read_only(dialog)
+                    dialog.exec_()
+                    return
+
                 if dialog.exec_():
-                    result = dialog.get_state_machine_data()
-                    if result:
-                        name, outcomes, start_state, remappings, description, defaults = (
-                            result
-                        )
+                    result = dialog.get_state_data()
+                    if result[0]:
+                        name, _plugin, _outcomes, remappings, description, defaults = result
+
+                        sibling_names = []
+                        if state_node.parent_container is not None:
+                            sibling_names = [n for n in state_node.parent_container.child_states.keys() if n != old_name]
+                        else:
+                            sibling_names = [n.name for n in self._iter_root_state_nodes() if n.name != old_name]
 
                         if name != old_name:
-                            if name in self.state_nodes:
+                            if name in sibling_names:
                                 QMessageBox.warning(
                                     self, "Error", f"State '{name}' already exists!"
                                 )
@@ -896,21 +1684,18 @@ class YasminEditor(QMainWindow):
                             if self.start_state == old_name:
                                 self.start_state = name
 
-                            del self.state_nodes[old_name]
-                            self.state_nodes[name] = state_node
+                            if state_node.parent_container and old_name in state_node.parent_container.child_states:
+                                del state_node.parent_container.child_states[old_name]
+                                state_node.parent_container.child_states[name] = state_node
                             state_node.name = name
-                            state_node.title.setPlainText(f"STATE MACHINE: {name}")
-                            title_rect = state_node.title.boundingRect()
-                            state_node.title.setPos(-title_rect.width() / 2, -75)
+                            self._rebuild_state_node_index()
+                            state_node.apply_display_mode()
+                            self.update_navigation_ui()
                             self.update_start_state_combo()
 
                         state_node.remappings = remappings
                         state_node.description = description
                         state_node.defaults = defaults
-
-                        if start_state:
-                            state_node.start_state = start_state
-                            state_node.update_start_state_label()
 
                         self.sync_blackboard_keys()
                         self.statusBar().showMessage(
@@ -939,6 +1724,11 @@ class YasminEditor(QMainWindow):
                     defaults=getattr(state_node, "defaults", []),
                 )
 
+                if read_only:
+                    self._set_dialog_read_only(dialog)
+                    dialog.exec_()
+                    return
+
                 if dialog.exec_():
                     result = dialog.get_concurrence_data()
                     if result:
@@ -961,21 +1751,19 @@ class YasminEditor(QMainWindow):
                             if self.start_state == old_name:
                                 self.start_state = name
 
-                            del self.state_nodes[old_name]
-                            self.state_nodes[name] = state_node
+                            if state_node.parent_container and old_name in state_node.parent_container.child_states:
+                                del state_node.parent_container.child_states[old_name]
+                                state_node.parent_container.child_states[name] = state_node
                             state_node.name = name
-                            state_node.title.setPlainText(f"CONCURRENCE: {name}")
-                            title_rect = state_node.title.boundingRect()
-                            state_node.title.setPos(-title_rect.width() / 2, -75)
+                            self._rebuild_state_node_index()
+                            state_node.apply_display_mode()
                             self.update_start_state_combo()
 
                         state_node.remappings = remappings
                         state_node.description = description
                         state_node.defaults = defaults
-
-                        if default_outcome:
-                            state_node.default_outcome = default_outcome
-                            state_node.update_default_outcome_label()
+                        state_node.default_outcome = default_outcome
+                        state_node.update_default_outcome_label()
 
                         self.sync_blackboard_keys()
                         self.statusBar().showMessage(f"Updated concurrence: {name}", 2000)
@@ -998,6 +1786,11 @@ class YasminEditor(QMainWindow):
                 defaults=getattr(state_node, "defaults", []),
             )
 
+            if read_only:
+                self._set_dialog_read_only(dialog)
+                dialog.exec_()
+                return
+
             if dialog.exec_():
                 result = dialog.get_state_data()
                 if result[0]:
@@ -1013,9 +1806,11 @@ class YasminEditor(QMainWindow):
                         if self.start_state == old_name:
                             self.start_state = name
 
-                        del self.state_nodes[old_name]
-                        self.state_nodes[name] = state_node
+                        if state_node.parent_container and old_name in state_node.parent_container.child_states:
+                            del state_node.parent_container.child_states[old_name]
+                            state_node.parent_container.child_states[name] = state_node
                         state_node.name = name
+                        self._rebuild_state_node_index()
                         state_node.text.setPlainText(name)
                         text_rect = state_node.text.boundingRect()
                         state_node.text.setPos(
@@ -1031,6 +1826,7 @@ class YasminEditor(QMainWindow):
 
     def edit_final_outcome(self, outcome_node: Optional[FinalOutcomeNode] = None) -> None:
         """Edit the description of a final outcome."""
+        read_only = self.current_read_only
         if outcome_node is None:
             selected_items = self.canvas.scene.selectedItems()
             for item in selected_items:
@@ -1047,6 +1843,11 @@ class YasminEditor(QMainWindow):
             description=getattr(outcome_node, "description", ""),
             parent=self,
         )
+
+        if read_only:
+            self._set_dialog_read_only(dialog)
+            dialog.exec_()
+            return
 
         if dialog.exec_():
             outcome_node.description = dialog.get_description()
@@ -1096,8 +1897,7 @@ class YasminEditor(QMainWindow):
                     name, plugin, 0, 0, remappings, description, defaults
                 )
                 container.add_child_state(child_node)
-                full_name = f"{container.name}.{name}"
-                self.state_nodes[full_name] = child_node
+                self._rebuild_state_node_index()
 
                 self.sync_blackboard_keys()
                 self.statusBar().showMessage(
@@ -1148,8 +1948,7 @@ class YasminEditor(QMainWindow):
                     defaults=defaults,
                 )
                 container.add_child_state(child_sm)
-                full_name = f"{container.name}.{name}"
-                self.state_nodes[full_name] = child_sm
+                self._rebuild_state_node_index()
 
                 self.sync_blackboard_keys()
                 self.statusBar().showMessage(
@@ -1202,8 +2001,7 @@ class YasminEditor(QMainWindow):
                     defaults=defaults,
                 )
                 container.add_child_state(child_cc)
-                full_name = f"{container.name}.{name}"
-                self.state_nodes[full_name] = child_cc
+                self._rebuild_state_node_index()
 
                 self.sync_blackboard_keys()
                 self.statusBar().showMessage(
@@ -1223,19 +2021,21 @@ class YasminEditor(QMainWindow):
             from_node: The source node.
             to_node: The target node.
         """
-        if isinstance(from_node, ContainerStateNode):
-            QMessageBox.warning(
-                self,
-                "Not Allowed",
-                "Container State Machines and Concurrence states cannot have external transitions.\n"
-                "Use Final Outcomes inside the container to define exit points.",
-            )
-            return
-
+        source_anchor = from_node
         has_outcomes = False
         outcomes_list = []
 
-        if hasattr(from_node, "plugin_info") and from_node.plugin_info:
+        if isinstance(from_node, ContainerStateNode):
+            if from_node.is_concurrence:
+                QMessageBox.warning(
+                    self,
+                    "Not Allowed",
+                    "Concurrence states cannot have external transitions.",
+                )
+                return
+            outcomes_list = list(from_node.final_outcomes.keys())
+            has_outcomes = bool(outcomes_list)
+        elif hasattr(from_node, "plugin_info") and from_node.plugin_info:
             has_outcomes = True
             outcomes_list = list(from_node.plugin_info.outcomes)
         elif isinstance(from_node, FinalOutcomeNode) and from_node.inside_container:
@@ -1278,13 +2078,10 @@ class YasminEditor(QMainWindow):
                 return
 
         if not is_in_concurrence:
-            used_outcomes = (
-                from_node.get_used_outcomes()
-                if hasattr(from_node, "get_used_outcomes")
-                else set()
-            )
             available_outcomes = [
-                o for o in outcomes_list if from_node.name + o not in used_outcomes
+                o
+                for o in outcomes_list
+                if not self._is_outcome_used(source_anchor, o)
             ]
 
             if not available_outcomes:
@@ -1297,7 +2094,7 @@ class YasminEditor(QMainWindow):
 
         if len(available_outcomes) == 1:
             outcome = available_outcomes[0]
-            self.create_connection(from_node, to_node, outcome)
+            self.create_connection(source_anchor, to_node, outcome)
         else:
             outcome, ok = QInputDialog.getItem(
                 self,
@@ -1308,7 +2105,7 @@ class YasminEditor(QMainWindow):
                 False,
             )
             if ok:
-                self.create_connection(from_node, to_node, outcome)
+                self.create_connection(source_anchor, to_node, outcome)
 
     def create_connection(
         self, from_node: StateNode, to_node: StateNode, outcome: str
@@ -1325,16 +2122,13 @@ class YasminEditor(QMainWindow):
             if isinstance(from_node.parent_container, ContainerStateNode):
                 is_in_concurrence = from_node.parent_container.is_concurrence
 
-        if not is_in_concurrence:
-            if hasattr(from_node, "get_used_outcomes"):
-                used_outcomes = from_node.get_used_outcomes()
-                if outcome in used_outcomes:
-                    QMessageBox.warning(
-                        self,
-                        "Error",
-                        f"Outcome '{outcome}' is already used for a transition!",
-                    )
-                    return
+        if not is_in_concurrence and self._is_outcome_used(from_node, outcome):
+            QMessageBox.warning(
+                self,
+                "Error",
+                f"Outcome '{outcome}' is already used for a transition!",
+            )
+            return
 
         connection = ConnectionLine(from_node, to_node, outcome)
         self.canvas.scene.addItem(connection)
@@ -1356,65 +2150,57 @@ class YasminEditor(QMainWindow):
 
     def add_final_outcome(self) -> None:
         """Add a final outcome to the state machine or selected container."""
+        if self.current_read_only:
+            return
         outcome_name, ok = QInputDialog.getText(
             self, "Final Outcome", "Enter final outcome name:"
         )
-        if ok and outcome_name:
-            selected_items = self.canvas.scene.selectedItems()
-            selected_container = None
+        if not (ok and outcome_name):
+            return
 
-            for item in selected_items:
-                if isinstance(item, ContainerStateNode):
-                    selected_container = item
-                    break
-
-            if selected_container:
-                if outcome_name in selected_container.final_outcomes:
-                    QMessageBox.warning(
-                        self,
-                        "Error",
-                        f"Final outcome '{outcome_name}' already exists in this container!",
-                    )
-                    return
-
-                rect = selected_container.rect()
-                x = rect.right() - 100
-                y = rect.top() + 70 + len(selected_container.final_outcomes) * 80
-
-                node = FinalOutcomeNode(outcome_name, x, y, inside_container=True)
-                node.parent_container = selected_container
-                node.setParentItem(selected_container)
-                selected_container.final_outcomes[outcome_name] = node
-                selected_container.auto_resize_for_children()
-
-                if (
-                    selected_container.is_concurrence
-                    and len(selected_container.final_outcomes) == 1
-                ):
-                    if not selected_container.default_outcome:
-                        selected_container.default_outcome = outcome_name
-                        selected_container.update_default_outcome_label()
-
-                self.statusBar().showMessage(
-                    f"Added final outcome '{outcome_name}' to container '{selected_container.name}'",
-                    2000,
+        active_container = self._get_active_edit_container()
+        if active_container is not None:
+            if outcome_name in active_container.final_outcomes:
+                QMessageBox.warning(
+                    self,
+                    "Error",
+                    f"Final outcome '{outcome_name}' already exists in this container!",
                 )
-            else:
-                if outcome_name in self.final_outcomes:
-                    QMessageBox.warning(
-                        self, "Error", f"Final outcome '{outcome_name}' already exists!"
-                    )
-                    return
+                return
 
-                x = 600
-                y = len(self.final_outcomes) * 150
-                node = FinalOutcomeNode(outcome_name, x, y)
-                self.canvas.scene.addItem(node)
-                self.final_outcomes[outcome_name] = node
-                self.statusBar().showMessage(f"Added final outcome: {outcome_name}", 2000)
+            node = FinalOutcomeNode(outcome_name, 0, 0, inside_container=True)
+            active_container.add_final_outcome(node)
+
+            if active_container.is_concurrence and len(active_container.final_outcomes) == 1:
+                if not active_container.default_outcome:
+                    active_container.default_outcome = outcome_name
+                    active_container.update_default_outcome_label()
+
+            self.update_scope_visibility()
+            self.statusBar().showMessage(
+                f"Added final outcome '{outcome_name}' to container '{active_container.name}'",
+                2000,
+            )
+            return
+
+        if outcome_name in self.final_outcomes:
+            QMessageBox.warning(
+                self, "Error", f"Final outcome '{outcome_name}' already exists!"
+            )
+            return
+
+        x = 600
+        y = len(self.final_outcomes) * 150
+        node = FinalOutcomeNode(outcome_name, x, y)
+        self.canvas.scene.addItem(node)
+        self.final_outcomes[outcome_name] = node
+        self.update_scope_visibility()
+        self.statusBar().showMessage(f"Added final outcome: {outcome_name}", 2000)
 
     def delete_selected(self) -> None:
         """Delete the selected items from the canvas."""
+        if self.current_read_only:
+            return
         selected_items = self.canvas.scene.selectedItems()
 
         for item in selected_items:
@@ -1439,6 +2225,7 @@ class YasminEditor(QMainWindow):
                         del parent.child_states[item.name]
 
                     self._remove_state_node_entries(item, parent.name)
+                    self._rebuild_state_node_index()
 
                     parent.auto_resize_for_children()
                     self.canvas.scene.removeItem(item)
@@ -1449,6 +2236,7 @@ class YasminEditor(QMainWindow):
                 else:
                     self.canvas.scene.removeItem(item)
                     self._remove_state_node_entries(item)
+                    self._rebuild_state_node_index()
                     self.update_start_state_combo()
                     self.sync_blackboard_keys()
                     self.statusBar().showMessage(f"Deleted state: {item.name}", 2000)
@@ -1569,10 +2357,17 @@ class YasminEditor(QMainWindow):
             self.root_sm_name = ""
             self.start_state = None
             self.root_sm_name_edit.clear()
+            self.root_sm_description = ""
             self.root_sm_description_edit.clear()
             self._blackboard_keys = []
             self._blackboard_key_metadata = {}
+            self.current_container = None
+            self.current_read_only = False
+            self.preview_root_container = None
+            self.preview_items = []
+            self.navigation_path = [("root", None, False)]
             self.refresh_blackboard_keys_list()
+            self.update_scope_header()
             self.update_start_state_combo()
             self.statusBar().showMessage("New state machine created", 2000)
             return True
@@ -1591,6 +2386,12 @@ class YasminEditor(QMainWindow):
                     return
 
                 self.xml_manager.load_from_xml(file_path)
+                self.current_container = None
+                self.current_read_only = False
+                self.navigation_path = [("root", None, False)]
+                self.update_navigation_ui()
+                self.update_scope_header()
+                self.update_scope_visibility()
                 self.statusBar().showMessage(f"Opened: {file_path}", 3000)
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to open file: {str(e)}")

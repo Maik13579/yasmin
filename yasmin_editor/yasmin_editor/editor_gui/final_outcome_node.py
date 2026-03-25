@@ -63,9 +63,6 @@ class FinalOutcomeNode(QGraphicsRectItem):
         text_rect = self.text.boundingRect()
         self.text.setPos(-text_rect.width() / 2, -text_rect.height() / 2)
 
-        if inside_container:
-            self.connection_port: ConnectionPort = ConnectionPort(self)
-
         self.update_tooltip()
 
     def update_tooltip(self) -> None:
@@ -85,7 +82,7 @@ class FinalOutcomeNode(QGraphicsRectItem):
     def itemChange(self, change: QGraphicsItem.GraphicsItemChange, value: Any) -> Any:
         if change == QGraphicsItem.ItemPositionChange and isinstance(value, QPointF):
             if self.parent_container:
-                container_rect = self.parent_container.rect()
+                container_rect = self.parent_container.get_child_bounds_rect()
                 outcome_rect = self.boundingRect()
                 new_pos: QPointF = value
 

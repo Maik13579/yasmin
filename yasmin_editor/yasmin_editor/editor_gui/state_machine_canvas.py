@@ -72,23 +72,18 @@ class StateMachineCanvas(QGraphicsView):
         )
 
         if isinstance(source_node, FinalOutcomeNode):
-            if isinstance(target_node, ContainerStateNode):
-                if source_container == target_node:
-                    return True
-                return True
+            return False
 
+        if isinstance(source_node, ContainerStateNode):
+            if source_node.is_concurrence:
+                return False
             if isinstance(target_node, FinalOutcomeNode):
-                if (
-                    source_container
-                    and target_container == source_container.parent_container
-                ):
-                    return True
-                if source_container == target_container:
-                    return True
+                return source_container == target_container
+            if isinstance(target_node, (StateNode, ContainerStateNode)):
+                return source_container == target_container
+            return False
 
-            return source_container != target_container and target_container is None
-
-        if isinstance(source_node, (StateNode, ContainerStateNode)):
+        if isinstance(source_node, StateNode):
             if isinstance(target_node, FinalOutcomeNode):
                 return source_container == target_container
 
@@ -116,6 +111,8 @@ class StateMachineCanvas(QGraphicsView):
         event: QEvent,
     ) -> None:
         """Start dragging a connection from a node's port."""
+        if self.editor_ref and self.editor_ref.current_read_only:
+            return
         self.drag_start_node = from_node
         self.is_dragging_connection = True
         self.setDragMode(QGraphicsView.NoDrag)
@@ -224,6 +221,9 @@ class StateMachineCanvas(QGraphicsView):
             if self.editor_ref:
                 menu: QMenu = QMenu()
 
+                if self.editor_ref.current_read_only:
+                    event.accept()
+                    return
                 add_state_action = menu.addAction("Add State")
                 add_sm_action = menu.addAction("Add State Machine")
                 add_cc_action = menu.addAction("Add Concurrence")
